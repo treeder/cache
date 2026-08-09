@@ -9,6 +9,5 @@ export {
   hashQueryParams,
   VersionManager,
   withCache,
-  withCacheGeneric,
 } from "./cache.js";
 

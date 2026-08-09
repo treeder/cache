@@ -299,5 +299,4 @@ export async function withCache({
   return freshData;
 }
 
-export { withCache as withCacheGeneric };
 

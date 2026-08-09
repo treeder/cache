@@ -96,15 +96,10 @@ npm test
 
 ```
 ├── index.js                     # Main package entrypoint
-├── functions/
-│   └── utils/
-│       ├── cache.js             # Domain-specific caching facade & helper functions
-│       └── cache/
-│           ├── cacheCore.js     # Core adapters, VersionManager, hashQueryParams, withCacheGeneric
-│           └── index.js         # Core library entrypoint
+├── cache.js                     # Core caching kernel with adapters, VersionManager, & withCache
 ├── tests/
-│   ├── cacheCore.test.js        # Unit tests for core caching library
-│   └── extendedCache.test.js    # Unit tests for Cloudflare KV adapter, SWR, & facade functions
+│   ├── cacheCore.test.js        # Unit tests for core caching functionality
+│   └── extendedCache.test.js    # Unit tests for Cloudflare KV adapter, SWR, & extended options
 ├── package.json
 └── README.md
 ```

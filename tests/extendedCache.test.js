@@ -5,7 +5,6 @@ import {
   hashQueryParams,
   VersionManager,
   withCache,
-  withCacheGeneric,
 } from "../index.js";
 
 
@@ -73,7 +72,7 @@ describe("SWR & Advanced Caching Features", () => {
     const fetchFn = vi.fn().mockResolvedValue({ data: "fresh-value" });
     const waitUntil = vi.fn((promise) => promise);
 
-    const result = await withCacheGeneric({
+    const result = await withCache({
       adapter,
       cacheKey: "swr:item",
       fetchFn,
@@ -90,7 +89,7 @@ describe("SWR & Advanced Caching Features", () => {
     expect(fetchFn).toHaveBeenCalledTimes(1);
 
     // Second call should return fresh value from primary cache
-    const secondCall = await withCacheGeneric({
+    const secondCall = await withCache({
       adapter,
       cacheKey: "swr:item",
       fetchFn,
@@ -104,7 +103,7 @@ describe("SWR & Advanced Caching Features", () => {
 
     const fetchFn = vi.fn().mockResolvedValue({ data: "bypass" });
 
-    const result = await withCacheGeneric({
+    const result = await withCache({
       adapter,
       cacheKey: "key",
       fetchFn,
@@ -119,7 +118,7 @@ describe("SWR & Advanced Caching Features", () => {
     const adapter = new MemoryAdapter();
     const fetchFn = vi.fn().mockResolvedValue(12345);
 
-    const res1 = await withCacheGeneric({
+    const res1 = await withCache({
       adapter,
       cacheKey: "numKey",
       fetchFn,
@@ -131,7 +130,7 @@ describe("SWR & Advanced Caching Features", () => {
     expect(res1).toBe(12345);
 
     // Primary read should use deserialize
-    const res2 = await withCacheGeneric({
+    const res2 = await withCache({
       adapter,
       cacheKey: "numKey",
       fetchFn,

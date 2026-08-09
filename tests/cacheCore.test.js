@@ -3,7 +3,7 @@ import {
   MemoryAdapter,
   hashQueryParams,
   VersionManager,
-  withCacheGeneric,
+  withCache,
 } from "../index.js";
 
 describe("Generic Cache Library Core", () => {
@@ -48,13 +48,13 @@ describe("Generic Cache Library Core", () => {
     });
   });
 
-  describe("withCacheGeneric", () => {
+  describe("withCache", () => {
     it("returns cached result on hit and fetches fresh data on miss", async () => {
       const adapter = new MemoryAdapter();
       const fetchFn = vi.fn().mockResolvedValue({ count: 42 });
 
       // First call (miss)
-      const res1 = await withCacheGeneric({
+      const res1 = await withCache({
         adapter,
         cacheKey: "test:item",
         fetchFn,
@@ -63,7 +63,7 @@ describe("Generic Cache Library Core", () => {
       expect(fetchFn).toHaveBeenCalledTimes(1);
 
       // Second call (hit)
-      const res2 = await withCacheGeneric({
+      const res2 = await withCache({
         adapter,
         cacheKey: "test:item",
         fetchFn,
