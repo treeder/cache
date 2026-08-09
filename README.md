@@ -20,20 +20,34 @@ npm install
 
 ## Quick Start
 
-### 1. Simple In-Memory Caching
+### 1. Using the Cache Class
 
 ```javascript
-import { MemoryAdapter, withCache } from 'cache'
+import { Cache, MemoryAdapter } from 'cache'
 
 const adapter = new MemoryAdapter()
+const cache = new Cache({ adapter })
 
-const data = await withCache({
-  adapter,
+const data = await cache.wrap({
   cacheKey: 'user:123',
   ttl: 300, // 5 minutes
   fetchFn: async () => {
     return await fetchUserData('123')
   },
+})
+```
+
+### 2. Global Default Adapter
+
+```javascript
+import { setDefaultAdapter, withCache } from 'cache'
+
+setDefaultAdapter(new MemoryAdapter())
+
+// Adapter option can be omitted when a global default is set
+const data = await withCache({
+  cacheKey: 'user:123',
+  fetchFn: () => fetchUserData('123'),
 })
 ```
 

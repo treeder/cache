@@ -129,29 +129,50 @@ export function hashQueryParams(params) {
   return Math.abs(hash).toString(36)
 }
 
+let defaultAdapter = null
+
+/**
+ * Set global default cache adapter.
+ * @param {Object|null} adapter
+ */
+export function setDefaultAdapter(adapter) {
+  defaultAdapter = adapter
+}
+
+/**
+ * Get global default cache adapter.
+ * @returns {Object|null}
+ */
+export function getDefaultAdapter() {
+  return defaultAdapter
+}
+
 /**
  * Generic Versioning Manager for cache invalidations.
  */
 export const VersionManager = {
   async getVersion(adapter, key, { defaultTtl = 86400 } = {}) {
-    if (!adapter) return String(Date.now())
-    let version = await adapter.get(key)
+    const targetAdapter = adapter || defaultAdapter
+    if (!targetAdapter) return String(Date.now())
+    let version = await targetAdapter.get(key)
     if (!version) {
       version = String(Date.now())
-      await adapter.put(key, version, { expirationTtl: defaultTtl })
+      await targetAdapter.put(key, version, { expirationTtl: defaultTtl })
     }
     return version
   },
 
   async rotateVersion(adapter, key, { expirationTtl = 86400 } = {}) {
-    if (!adapter) return
-    await adapter.put(key, String(Date.now()), { expirationTtl })
+    const targetAdapter = adapter || defaultAdapter
+    if (!targetAdapter) return
+    await targetAdapter.put(key, String(Date.now()), { expirationTtl })
   },
 
   async deleteKeys(adapter, keys = []) {
-    if (!adapter) return
+    const targetAdapter = adapter || defaultAdapter
+    if (!targetAdapter) return
     for (const key of keys) {
-      if (key) await adapter.delete(key)
+      if (key) await targetAdapter.delete(key)
     }
   },
 }
@@ -177,7 +198,8 @@ export async function withCache({
   shouldCache = (val) => val !== undefined && val !== null && !(val instanceof Response),
   waitUntil = (promise) => promise.catch(() => {}),
 }) {
-  if (bypassCache || !adapter) {
+  const targetAdapter = adapter || defaultAdapter
+  if (bypassCache || !targetAdapter) {
     return fetchFn()
   }
 
@@ -185,9 +207,9 @@ export async function withCache({
     // 1. Try primary cache read
     let cached
     if (useJSON) {
-      cached = await adapter.getJSON(cacheKey)
+      cached = await targetAdapter.getJSON(cacheKey)
     } else {
-      const raw = await adapter.get(cacheKey)
+      const raw = await targetAdapter.get(cacheKey)
       cached = raw !== null && raw !== undefined ? deserialize(raw) : null
     }
 
@@ -202,9 +224,9 @@ export async function withCache({
     if (enableSWR) {
       let stale
       if (useJSON) {
-        stale = await adapter.getJSON(staleKey)
+        stale = await targetAdapter.getJSON(staleKey)
       } else {
-        const raw = await adapter.get(staleKey)
+        const raw = await targetAdapter.get(staleKey)
         stale = raw !== null && raw !== undefined ? deserialize(raw) : null
       }
 
@@ -218,16 +240,16 @@ export async function withCache({
               const freshData = await fetchFn()
               if (shouldCache(freshData)) {
                 if (useJSON) {
-                  await adapter.putJSON(cacheKey, freshData, {
+                  await targetAdapter.putJSON(cacheKey, freshData, {
                     expirationTtl: ttl,
                   })
-                  await adapter.putJSON(staleKey, freshData, {
+                  await targetAdapter.putJSON(staleKey, freshData, {
                     expirationTtl: staleTtl,
                   })
                 } else {
                   const payload = serialize(freshData)
-                  await adapter.put(cacheKey, payload, { expirationTtl: ttl })
-                  await adapter.put(staleKey, payload, {
+                  await targetAdapter.put(cacheKey, payload, { expirationTtl: ttl })
+                  await targetAdapter.put(staleKey, payload, {
                     expirationTtl: staleTtl,
                   })
                 }
@@ -262,17 +284,17 @@ export async function withCache({
       waitUntil(
         (async () => {
           if (useJSON) {
-            await adapter.putJSON(cacheKey, freshData, { expirationTtl: ttl })
+            await targetAdapter.putJSON(cacheKey, freshData, { expirationTtl: ttl })
             if (enableSWR) {
-              await adapter.putJSON(staleKey, freshData, {
+              await targetAdapter.putJSON(staleKey, freshData, {
                 expirationTtl: staleTtl,
               })
             }
           } else {
             const payload = serialize(freshData)
-            await adapter.put(cacheKey, payload, { expirationTtl: ttl })
+            await targetAdapter.put(cacheKey, payload, { expirationTtl: ttl })
             if (enableSWR) {
-              await adapter.put(staleKey, payload, { expirationTtl: staleTtl })
+              await targetAdapter.put(staleKey, payload, { expirationTtl: staleTtl })
             }
           }
         })().catch((err) => {
@@ -289,4 +311,89 @@ export async function withCache({
   }
 
   return freshData
+}
+
+/**
+ * Cache wrapper class bound to an adapter instance or global default adapter.
+ */
+export class Cache {
+  constructor({ adapter = null, ...defaultOptions } = {}) {
+    this.adapter = adapter
+    this.defaultOptions = defaultOptions
+  }
+
+  static setDefaultAdapter(adapter) {
+    setDefaultAdapter(adapter)
+  }
+
+  static getDefaultAdapter() {
+    return getDefaultAdapter()
+  }
+
+  get targetAdapter() {
+    return this.adapter || defaultAdapter
+  }
+
+  async get(key) {
+    const adp = this.targetAdapter
+    if (!adp) return null
+    return adp.get(key)
+  }
+
+  async put(key, val, opts) {
+    const adp = this.targetAdapter
+    if (!adp) return
+    return adp.put(key, val, opts)
+  }
+
+  async delete(key) {
+    const adp = this.targetAdapter
+    if (!adp) return
+    return adp.delete(key)
+  }
+
+  async getJSON(key) {
+    const adp = this.targetAdapter
+    if (!adp) return null
+    return adp.getJSON(key)
+  }
+
+  async putJSON(key, val, opts) {
+    const adp = this.targetAdapter
+    if (!adp) return
+    return adp.putJSON(key, val, opts)
+  }
+
+  /**
+   * Wrap function call with caching.
+   * Supports `cache.wrap({ cacheKey, fetchFn, ... })` or `cache.wrap(cacheKey, fetchFn, options)`
+   */
+  async wrap(firstArg, fetchFnArg, optionsArg = {}) {
+    let opts = {}
+    if (typeof firstArg === 'object' && firstArg !== null) {
+      opts = firstArg
+    } else if (typeof firstArg === 'string' && typeof fetchFnArg === 'function') {
+      opts = { cacheKey: firstArg, fetchFn: fetchFnArg, ...optionsArg }
+    } else {
+      opts = firstArg || {}
+    }
+
+    return withCache({
+      adapter: this.targetAdapter,
+      ...this.defaultOptions,
+      ...opts,
+    })
+  }
+
+  async getVersion(key, opts) {
+    return VersionManager.getVersion(this.targetAdapter, key, opts)
+  }
+
+  async rotateVersion(key, opts) {
+    return VersionManager.rotateVersion(this.targetAdapter, key, opts)
+  }
+
+  async deleteKeys(keys) {
+    return VersionManager.deleteKeys(this.targetAdapter, keys)
+  }
 }
