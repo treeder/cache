@@ -15,7 +15,7 @@ A lightweight, framework-agnostic, generic JavaScript caching library with stora
 ## Installation
 
 ```bash
-npm install
+npm install treeder/cache
 ```
 
 ## Quick Start
@@ -23,7 +23,7 @@ npm install
 ### 1. Using the Cache Class
 
 ```javascript
-import { Cache, MemoryAdapter } from 'cache'
+import { Cache, MemoryAdapter } from 'treeder/cache'
 
 const adapter = new MemoryAdapter()
 const cache = new Cache({ adapter })
@@ -40,7 +40,7 @@ const data = await cache.wrap({
 ### 2. Global Default Adapter
 
 ```javascript
-import { setDefaultAdapter, withCache } from 'cache'
+import { setDefaultAdapter, withCache } from 'treeder/cache'
 
 setDefaultAdapter(new MemoryAdapter())
 
@@ -54,7 +54,7 @@ const data = await withCache({
 ### 2. Cloudflare KV Adapter with SWR
 
 ```javascript
-import { CloudflareKVAdapter, withCache } from 'cache'
+import { CloudflareKVAdapter, withCache } from 'treeder/cache'
 
 export default {
   async fetch(request, env, ctx) {
@@ -80,7 +80,7 @@ export default {
 ### 3. Version Manager & Invalidation
 
 ```javascript
-import { MemoryAdapter, VersionManager } from 'cache'
+import { MemoryAdapter, VersionManager } from 'treeder/cache'
 
 const adapter = new MemoryAdapter()
 
@@ -94,7 +94,7 @@ await VersionManager.rotateVersion(adapter, 'products:version')
 ### 4. Query Parameter Hashing
 
 ```javascript
-import { hashQueryParams } from 'cache'
+import { hashQueryParams } from 'treeder/cache'
 
 const hash = hashQueryParams({ page: 1, filter: 'active', sort: 'desc' })
 // Returns deterministic hash string regardless of property order
