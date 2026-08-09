@@ -1,6 +1,6 @@
 {
   "name": "cache",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Generic, framework-agnostic caching library with storage adapters (Cloudflare KV, Memory), version manager, and SWR support.",
   "main": "index.js",
   "type": "module",
