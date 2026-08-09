@@ -12,4 +12,6 @@ export {
   Cache,
   setDefaultAdapter,
   getDefaultAdapter,
+  getInFlightCount,
+  clearInFlight,
 } from './cache.js'

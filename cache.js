@@ -132,6 +132,25 @@ export function hashQueryParams(params) {
 let defaultAdapter = null
 
 /**
+ * Global map tracking active in-flight fetch Promises by cache key.
+ */
+const inFlightFetches = new Map()
+
+/**
+ * Returns the current number of in-flight requests.
+ */
+export function getInFlightCount() {
+  return inFlightFetches.size
+}
+
+/**
+ * Clears all active in-flight request trackers.
+ */
+export function clearInFlight() {
+  inFlightFetches.clear()
+}
+
+/**
  * Set global default cache adapter.
  * @param {Object|null} adapter
  */
@@ -165,7 +184,13 @@ export const VersionManager = {
   async rotateVersion(adapter, key, { expirationTtl = 86400 } = {}) {
     const targetAdapter = adapter || defaultAdapter
     if (!targetAdapter) return
-    await targetAdapter.put(key, String(Date.now()), { expirationTtl })
+    const current = await targetAdapter.get(key)
+    let nextVersion = String(Date.now())
+    if (nextVersion === current) {
+      nextVersion = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`
+    }
+    await targetAdapter.put(key, nextVersion, { expirationTtl })
+    return nextVersion
   },
 
   async deleteKeys(adapter, keys = []) {
@@ -179,11 +204,12 @@ export const VersionManager = {
 
 /**
  * Core generic `withCache` function.
- * Handles cache hits, misses, optional SWR revalidation, and background scheduling.
+ * Handles cache hits, misses, optional SWR revalidation, single-key metadata wrapping, automatic versioning, and in-flight request coalescing.
  */
 export async function withCache({
   adapter,
   cacheKey,
+  versionKey = null,
   fetchFn,
   bypassCache = false,
   ttl = 300,
@@ -191,7 +217,6 @@ export async function withCache({
   logger = console,
   enableSWR = false,
   staleTtl = 3600,
-  staleKey = `${cacheKey}:stale`,
   useJSON = true,
   serialize = String,
   deserialize = Number,
@@ -203,73 +228,108 @@ export async function withCache({
     return fetchFn()
   }
 
-  try {
-    // 1. Try primary cache read
-    let cached
-    if (useJSON) {
-      cached = await targetAdapter.getJSON(cacheKey)
+  let effectiveKey = cacheKey
+  if (versionKey) {
+    const version = await VersionManager.getVersion(targetAdapter, versionKey)
+    if (version) {
+      effectiveKey = `${versionKey}:${version}:${cacheKey}`
+    }
+  }
+
+  const storageTtl = enableSWR ? staleTtl : ttl
+
+  async function writeEnvelope(data) {
+    const now = Date.now()
+    const payload = useJSON ? data : serialize(data)
+    const envelope = {
+      _swr: true,
+      v: payload,
+      e: now + ttl * 1000,
+      s: enableSWR ? now + staleTtl * 1000 : now + ttl * 1000,
+    }
+    const opts = { expirationTtl: storageTtl }
+    if (typeof targetAdapter.putJSON === 'function') {
+      await targetAdapter.putJSON(effectiveKey, envelope, opts)
     } else {
-      const raw = await targetAdapter.get(cacheKey)
-      cached = raw !== null && raw !== undefined ? deserialize(raw) : null
+      await targetAdapter.put(effectiveKey, JSON.stringify(envelope), opts)
     }
+  }
 
-    if (cached !== null && cached !== undefined) {
-      if (logger?.log) {
-        logger.log(`${loggerLabel} cache hit for key ${cacheKey}`)
-      }
-      return cached
-    }
-
-    // 2. If SWR enabled, check stale cache
-    if (enableSWR) {
-      let stale
-      if (useJSON) {
-        stale = await targetAdapter.getJSON(staleKey)
-      } else {
-        const raw = await targetAdapter.get(staleKey)
-        stale = raw !== null && raw !== undefined ? deserialize(raw) : null
-      }
-
-      if (stale !== null && stale !== undefined) {
-        if (logger?.log) {
-          logger.log(`${loggerLabel} stale cache hit for key ${cacheKey}, triggering async revalidation`)
+  try {
+    // 1. Try single-key metadata read
+    let envelope = null
+    if (typeof targetAdapter.getJSON === 'function') {
+      envelope = await targetAdapter.getJSON(effectiveKey)
+    } else {
+      const raw = await targetAdapter.get(effectiveKey)
+      if (raw !== null && raw !== undefined) {
+        try {
+          envelope = JSON.parse(raw)
+        } catch {
+          envelope = raw
         }
-        waitUntil(
-          (async () => {
-            try {
-              const freshData = await fetchFn()
-              if (shouldCache(freshData)) {
-                if (useJSON) {
-                  await targetAdapter.putJSON(cacheKey, freshData, {
-                    expirationTtl: ttl,
-                  })
-                  await targetAdapter.putJSON(staleKey, freshData, {
-                    expirationTtl: staleTtl,
-                  })
-                } else {
-                  const payload = serialize(freshData)
-                  await targetAdapter.put(cacheKey, payload, { expirationTtl: ttl })
-                  await targetAdapter.put(staleKey, payload, {
-                    expirationTtl: staleTtl,
-                  })
+      }
+    }
+
+    if (envelope !== null && envelope !== undefined) {
+      const isEnvelope =
+        typeof envelope === 'object' && envelope !== null && envelope._swr === true
+
+      if (isEnvelope) {
+        const now = Date.now()
+        const value = useJSON ? envelope.v : deserialize(envelope.v)
+
+        if (now <= envelope.e) {
+          // Fresh Cache Hit
+          if (logger?.log) {
+            logger.log(`${loggerLabel} cache hit for key ${effectiveKey}`)
+          }
+          return value
+        }
+
+        if (enableSWR && now <= envelope.s) {
+          // Stale Cache Hit -> Return stale value & trigger background revalidation (if not in-flight)
+          if (logger?.log) {
+            logger.log(
+              `${loggerLabel} stale cache hit for key ${effectiveKey}, triggering async revalidation`,
+            )
+          }
+
+          if (!inFlightFetches.has(effectiveKey)) {
+            const revalidatePromise = (async () => {
+              try {
+                const freshData = await fetchFn()
+                if (shouldCache(freshData)) {
+                  await writeEnvelope(freshData)
+                  if (logger?.log) {
+                    logger.log(`${loggerLabel} revalidation completed for key ${effectiveKey}`)
+                  }
                 }
-                if (logger?.log) {
-                  logger.log(`${loggerLabel} revalidation completed for key ${cacheKey}`)
+              } catch (err) {
+                if (logger?.error) {
+                  logger.error(`[SWR Revalidate Failed] ${loggerLabel}`, err)
                 }
               }
-            } catch (err) {
-              if (logger?.error) {
-                logger.error(`[SWR Revalidate Failed] ${loggerLabel}`, err)
-              }
-            }
-          })(),
-        )
-        return stale
+            })().finally(() => {
+              inFlightFetches.delete(effectiveKey)
+            })
+
+            inFlightFetches.set(effectiveKey, revalidatePromise)
+            waitUntil(revalidatePromise)
+          }
+
+          return value
+        }
+
+        // Expired Cache Entry
+        if (logger?.log) {
+          logger.log(`${loggerLabel} expired cache entry for key ${effectiveKey}`)
+        }
       }
     }
 
     if (logger?.log) {
-      logger.log(`${loggerLabel} cache miss for key ${cacheKey}`)
+      logger.log(`${loggerLabel} cache miss for key ${effectiveKey}`)
     }
   } catch (err) {
     if (logger?.error) {
@@ -277,40 +337,42 @@ export async function withCache({
     }
   }
 
-  const freshData = await fetchFn()
-
-  try {
-    if (shouldCache(freshData)) {
-      waitUntil(
-        (async () => {
-          if (useJSON) {
-            await targetAdapter.putJSON(cacheKey, freshData, { expirationTtl: ttl })
-            if (enableSWR) {
-              await targetAdapter.putJSON(staleKey, freshData, {
-                expirationTtl: staleTtl,
-              })
-            }
-          } else {
-            const payload = serialize(freshData)
-            await targetAdapter.put(cacheKey, payload, { expirationTtl: ttl })
-            if (enableSWR) {
-              await targetAdapter.put(staleKey, payload, { expirationTtl: staleTtl })
-            }
-          }
-        })().catch((err) => {
-          if (logger?.error) {
-            logger.error(`${loggerLabel} cache put failed for key ${cacheKey}`, err)
-          }
-        }),
-      )
+  // 2. Request Coalescing / In-flight deduplication for Cache Misses
+  if (inFlightFetches.has(effectiveKey)) {
+    if (logger?.log) {
+      logger.log(`${loggerLabel} joining in-flight request for key ${effectiveKey}`)
     }
-  } catch (err) {
-    if (logger?.error) {
-      logger.error(`${loggerLabel} cache schedule put error`, err)
-    }
+    return await inFlightFetches.get(effectiveKey)
   }
 
-  return freshData
+  const fetchPromise = (async () => {
+    const freshData = await fetchFn()
+
+    try {
+      if (shouldCache(freshData)) {
+        waitUntil(
+          (async () => {
+            await writeEnvelope(freshData)
+          })().catch((err) => {
+            if (logger?.error) {
+              logger.error(`${loggerLabel} cache put failed for key ${effectiveKey}`, err)
+            }
+          }),
+        )
+      }
+    } catch (err) {
+      if (logger?.error) {
+        logger.error(`${loggerLabel} cache schedule put error`, err)
+      }
+    }
+
+    return freshData
+  })().finally(() => {
+    inFlightFetches.delete(effectiveKey)
+  })
+
+  inFlightFetches.set(effectiveKey, fetchPromise)
+  return await fetchPromise
 }
 
 /**

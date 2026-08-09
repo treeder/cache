@@ -139,6 +139,30 @@ describe('Cache Class & Global Adapter Support', () => {
       expect(await cache.get('vkey')).toBeNull()
     })
 
+    it('supports versionKey in constructor defaultOptions', async () => {
+      const adapter = new MemoryAdapter()
+      const userCache = new Cache({ adapter, versionKey: 'users' })
+      let fetchCount = 0
+      const fetchFn = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        return `user-${fetchCount}`
+      })
+
+      const u1 = await userCache.wrap({ cacheKey: '123', fetchFn })
+      expect(u1).toBe('user-1')
+      expect(fetchFn).toHaveBeenCalledTimes(1)
+
+      const u2 = await userCache.wrap({ cacheKey: '123', fetchFn })
+      expect(u2).toBe('user-1')
+      expect(fetchFn).toHaveBeenCalledTimes(1)
+
+      await userCache.rotateVersion('users')
+
+      const u3 = await userCache.wrap({ cacheKey: '123', fetchFn })
+      expect(u3).toBe('user-2')
+      expect(fetchFn).toHaveBeenCalledTimes(2)
+    })
+
     it('falls back to global default adapter if instance is created without an adapter', async () => {
       const globalAdapter = new MemoryAdapter()
       setDefaultAdapter(globalAdapter)
