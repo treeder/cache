@@ -1,13 +1,11 @@
 {
-  "name": "@pearpop/cache",
+  "name": "cache",
   "version": "1.0.0",
   "description": "Generic, framework-agnostic caching library with storage adapters (Cloudflare KV, Memory), version manager, and SWR support.",
   "main": "index.js",
   "type": "module",
   "exports": {
-    ".": "./index.js",
-    "./core": "./functions/utils/cache/index.js",
-    "./facade": "./functions/utils/cache.js"
+    ".": "./index.js"
   },
   "scripts": {
     "test": "vitest run",
@@ -21,7 +19,7 @@
     "memory-cache",
     "version-manager"
   ],
-  "author": "Pearpop",
+  "author": "@treeder",
   "license": "MIT",
   "devDependencies": {
     "vitest": "^3.0.5"

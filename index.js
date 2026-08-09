@@ -8,7 +8,7 @@ export {
   CloudflareKVAdapter,
   hashQueryParams,
   VersionManager,
+  withCache,
   withCacheGeneric,
-} from './functions/utils/cache/index.js'
+} from "./cache.js";
 
-export * as domainFacade from './functions/utils/cache.js'
