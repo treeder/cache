@@ -8,7 +8,8 @@ A lightweight, framework-agnostic, generic JavaScript caching library with stora
 - **Storage Adapters**:
   - `MemoryAdapter`: In-memory Map store with TTL support for local development, testing, and Node environments.
   - `CloudflareKVAdapter`: Adapter wrapping Cloudflare Workers KV bindings.
-- **Stale-While-Revalidate (SWR)**: Serve stale cached data instantly while trigger background revalidation.
+- **Stale-While-Revalidate (SWR)**: Serve stale cached data instantly while triggering isolated background revalidation.
+- **Cross-Request Safe Coalescing**: Deduplicates concurrent cold cache misses with `waitUntil` registration, `AbortSignal` / request `context` awareness, `inFlightTtlMs` staleness eviction (default `30000`ms), and automatic retry if an earlier Cloudflare Workers request's Promise can no longer settle.
 - **VersionManager**: Automatic cache version minting, key rotation, and grouped invalidation.
 - **Deterministic Parameter Hashing**: `hashQueryParams` converts query objects to sorted fingerprint hashes.
 
@@ -66,7 +67,7 @@ export default {
       ttl: 60, // Cache fresh for 60 seconds
       enableSWR: true, // Enable Stale-While-Revalidate
       staleTtl: 3600, // Keep stale copy for 1 hour
-      waitUntil: (promise) => ctx.waitUntil(promise),
+      context: ctx, // Or pass waitUntil: (p) => ctx.waitUntil(p) and optional signal / inFlightTtlMs
       fetchFn: async () => {
         return await computeTrendingData()
       },

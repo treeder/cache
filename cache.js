@@ -131,16 +131,161 @@ export function hashQueryParams(params) {
 
 let defaultAdapter = null
 
+const DEFAULT_INFLIGHT_TTL_MS = 30_000
+const RETRY_SENTINEL = Symbol('cache.retry')
+const ABORTED_SENTINEL = Symbol('cache.aborted')
+
+const now =
+  typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? () => performance.now()
+    : () => Date.now()
+
+function getSignalInfo(signalOpt, context) {
+  if (signalOpt && typeof signalOpt === 'object' && 'aborted' in signalOpt) {
+    return { signal: signalOpt, explicit: true }
+  }
+  if (context && typeof context === 'object') {
+    for (const read of [() => context.request?.signal, () => context.req?.raw?.signal, () => context.signal]) {
+      try {
+        const signal = read()
+        if (signal && typeof signal === 'object' && 'aborted' in signal) {
+          return { signal, explicit: false }
+        }
+      } catch {}
+    }
+  }
+  return { signal: null, explicit: false }
+}
+
+function getWaitUntilInfo(waitUntilOpt, context) {
+  if (typeof waitUntilOpt === 'function') {
+    return { fn: waitUntilOpt, hasLifecycle: true }
+  }
+  if (context && typeof context === 'object') {
+    for (const getTarget of [() => context, () => context.executionCtx, () => context.ctx]) {
+      try {
+        const target = getTarget()
+        if (typeof target?.waitUntil === 'function') {
+          return { fn: target.waitUntil.bind(target), hasLifecycle: true }
+        }
+      } catch {}
+    }
+  }
+  return { fn: null, hasLifecycle: false }
+}
+
+function safeWaitUntil(waitUntilFn, promise) {
+  const guarded = Promise.resolve(promise).catch(() => {})
+  if (typeof waitUntilFn === 'function') {
+    try {
+      waitUntilFn(guarded)
+    } catch {}
+  }
+}
+
+function toAbortError(signal) {
+  return signal?.reason !== undefined ? signal.reason : new DOMException('The operation was aborted.', 'AbortError')
+}
+
+function isCrossRequestError(err) {
+  if (!err) return false
+  const msg = String(err?.message || err)
+  return (
+    msg.includes('created by a request that has since ended') ||
+    msg.includes('handle_cross_request_promise_resolution') ||
+    msg.includes('Cannot perform I/O on behalf of a different request')
+  )
+}
+
+function isStaleEntry(entry, ttlMs) {
+  if (!entry) return false
+  if (entry.aborted || entry.signal?.aborted) return true
+  if (Number.isFinite(ttlMs) && now() - entry.startedAt >= ttlMs) return true
+  return false
+}
+
+function waitForEntry(entry, callerSignal, explicitCallerSignal, ttlMs) {
+  if (explicitCallerSignal && callerSignal?.aborted) {
+    return Promise.resolve(ABORTED_SENTINEL)
+  }
+  if (entry.aborted || entry.signal?.aborted) {
+    return Promise.resolve(RETRY_SENTINEL)
+  }
+  const remainingMs = Number.isFinite(ttlMs)
+    ? Math.min(0x7fffffff, Math.max(0, ttlMs - (now() - entry.startedAt)))
+    : null
+  if (remainingMs === 0) {
+    return Promise.resolve(RETRY_SENTINEL)
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let ttlTimer = null
+
+    const cleanup = () => {
+      if (ttlTimer !== null) {
+        clearTimeout(ttlTimer)
+        ttlTimer = null
+      }
+      entry.abortListeners?.delete(onOriginAbort)
+      if (explicitCallerSignal && callerSignal && typeof callerSignal.removeEventListener === 'function') {
+        try {
+          callerSignal.removeEventListener('abort', onCallerAbort)
+        } catch {}
+      }
+    }
+
+    const finish = (outcome) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(outcome)
+    }
+
+    const finishError = (err) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(err)
+    }
+
+    const onOriginAbort = () => finish(RETRY_SENTINEL)
+    const onCallerAbort = () => finish(ABORTED_SENTINEL)
+
+    entry.abortListeners?.add(onOriginAbort)
+    if (explicitCallerSignal && callerSignal && typeof callerSignal.addEventListener === 'function') {
+      if (callerSignal.aborted) {
+        onCallerAbort()
+        return
+      }
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true })
+    }
+
+    if (remainingMs !== null) {
+      ttlTimer = setTimeout(() => {
+        ttlTimer = null
+        finish(RETRY_SENTINEL)
+      }, remainingMs)
+    }
+
+    ;(async () => await entry.promise)().then(
+      (val) => finish(val),
+      (err) => finishError(err),
+    )
+  })
+}
+
 /**
- * Global map tracking active in-flight fetch Promises by cache key.
+ * Global maps tracking active in-flight foreground fetches and background SWR revalidations by cache key.
  */
 const inFlightFetches = new Map()
+const inFlightRevalidations = new Map()
 
 /**
  * Returns the current number of in-flight requests.
  */
 export function getInFlightCount() {
-  return inFlightFetches.size
+  return inFlightFetches.size + inFlightRevalidations.size
 }
 
 /**
@@ -148,6 +293,7 @@ export function getInFlightCount() {
  */
 export function clearInFlight() {
   inFlightFetches.clear()
+  inFlightRevalidations.clear()
 }
 
 /**
@@ -204,7 +350,7 @@ export const VersionManager = {
 
 /**
  * Core generic `withCache` function.
- * Handles cache hits, misses, optional SWR revalidation, single-key metadata wrapping, automatic versioning, and in-flight request coalescing.
+ * Handles cache hits, misses, optional SWR revalidation, single-key metadata wrapping, automatic versioning, and cross-request safe in-flight request coalescing.
  */
 export async function withCache({
   adapter,
@@ -221,12 +367,24 @@ export async function withCache({
   serialize = String,
   deserialize = Number,
   shouldCache = (val) => val !== undefined && val !== null && !(val instanceof Response),
-  waitUntil = (promise) => promise.catch(() => {}),
+  waitUntil,
+  signal,
+  context = null,
+  inFlightTtlMs = DEFAULT_INFLIGHT_TTL_MS,
 }) {
+  const { signal: callerSignal, explicit: explicitSignal } = getSignalInfo(signal, context)
+  if (explicitSignal && callerSignal?.aborted) {
+    throw toAbortError(callerSignal)
+  }
+
   const targetAdapter = adapter || defaultAdapter
   if (bypassCache || !targetAdapter) {
     return fetchFn()
   }
+
+  const { fn: waitUntilFn, hasLifecycle: hasLifecycleWaitUntil } = getWaitUntilInfo(waitUntil, context)
+  const effectiveInFlightTtlMs =
+    typeof inFlightTtlMs === 'number' && inFlightTtlMs > 0 ? inFlightTtlMs : DEFAULT_INFLIGHT_TTL_MS
 
   let effectiveKey = cacheKey
   if (versionKey) {
@@ -239,13 +397,13 @@ export async function withCache({
   const storageTtl = enableSWR ? staleTtl : ttl
 
   async function writeEnvelope(data) {
-    const now = Date.now()
+    const writeTime = Date.now()
     const payload = useJSON ? data : serialize(data)
     const envelope = {
       _swr: true,
       v: payload,
-      e: now + ttl * 1000,
-      s: enableSWR ? now + staleTtl * 1000 : now + ttl * 1000,
+      e: writeTime + ttl * 1000,
+      s: enableSWR ? writeTime + staleTtl * 1000 : writeTime + ttl * 1000,
     }
     const opts = { expirationTtl: storageTtl }
     if (typeof targetAdapter.putJSON === 'function') {
@@ -272,14 +430,13 @@ export async function withCache({
     }
 
     if (envelope !== null && envelope !== undefined) {
-      const isEnvelope =
-        typeof envelope === 'object' && envelope !== null && envelope._swr === true
+      const isEnvelope = typeof envelope === 'object' && envelope !== null && envelope._swr === true
 
       if (isEnvelope) {
-        const now = Date.now()
+        const readTime = Date.now()
         const value = useJSON ? envelope.v : deserialize(envelope.v)
 
-        if (now <= envelope.e) {
+        if (readTime <= envelope.e) {
           // Fresh Cache Hit
           if (logger?.log) {
             logger.log(`${loggerLabel} cache hit for key ${effectiveKey}`)
@@ -287,15 +444,29 @@ export async function withCache({
           return value
         }
 
-        if (enableSWR && now <= envelope.s) {
-          // Stale Cache Hit -> Return stale value & trigger background revalidation (if not in-flight)
+        if (enableSWR && readTime <= envelope.s) {
+          // Stale Cache Hit -> Return stale value & trigger background revalidation (if not actively in-flight)
           if (logger?.log) {
-            logger.log(
-              `${loggerLabel} stale cache hit for key ${effectiveKey}, triggering async revalidation`,
-            )
+            logger.log(`${loggerLabel} stale cache hit for key ${effectiveKey}, triggering async revalidation`)
           }
 
-          if (!inFlightFetches.has(effectiveKey)) {
+          const existingReval = inFlightRevalidations.get(effectiveKey)
+          if (existingReval && isStaleEntry(existingReval, effectiveInFlightTtlMs)) {
+            inFlightRevalidations.delete(effectiveKey)
+          }
+          const existingFetch = inFlightFetches.get(effectiveKey)
+          if (existingFetch && isStaleEntry(existingFetch, effectiveInFlightTtlMs)) {
+            inFlightFetches.delete(effectiveKey)
+          }
+
+          if (!inFlightRevalidations.has(effectiveKey) && !inFlightFetches.has(effectiveKey)) {
+            const revalEntry = {
+              promise: null,
+              startedAt: now(),
+              signal: hasLifecycleWaitUntil ? null : callerSignal,
+              aborted: false,
+            }
+
             const revalidatePromise = (async () => {
               try {
                 const freshData = await fetchFn()
@@ -311,11 +482,14 @@ export async function withCache({
                 }
               }
             })().finally(() => {
-              inFlightFetches.delete(effectiveKey)
+              if (inFlightRevalidations.get(effectiveKey) === revalEntry) {
+                inFlightRevalidations.delete(effectiveKey)
+              }
             })
 
-            inFlightFetches.set(effectiveKey, revalidatePromise)
-            waitUntil(revalidatePromise)
+            revalEntry.promise = revalidatePromise
+            inFlightRevalidations.set(effectiveKey, revalEntry)
+            safeWaitUntil(waitUntilFn, revalidatePromise)
           }
 
           return value
@@ -338,27 +512,108 @@ export async function withCache({
   }
 
   // 2. Request Coalescing / In-flight deduplication for Cache Misses
-  if (inFlightFetches.has(effectiveKey)) {
+  let joinAttempts = 0
+  const MAX_JOIN_ATTEMPTS = 3
+
+  while (joinAttempts < MAX_JOIN_ATTEMPTS) {
+    const existing = inFlightFetches.get(effectiveKey)
+    if (!existing) break
+
+    if (isStaleEntry(existing, effectiveInFlightTtlMs)) {
+      inFlightFetches.delete(effectiveKey)
+      break
+    }
+
+    joinAttempts++
     if (logger?.log) {
       logger.log(`${loggerLabel} joining in-flight request for key ${effectiveKey}`)
     }
-    return await inFlightFetches.get(effectiveKey)
+
+    try {
+      const outcome = await waitForEntry(existing, callerSignal, explicitSignal, effectiveInFlightTtlMs)
+      if (outcome === ABORTED_SENTINEL) {
+        throw toAbortError(callerSignal)
+      }
+      if (outcome === RETRY_SENTINEL) {
+        if (inFlightFetches.get(effectiveKey) === existing) {
+          inFlightFetches.delete(effectiveKey)
+        }
+        continue
+      }
+      return outcome
+    } catch (err) {
+      if (explicitSignal && callerSignal?.aborted) {
+        throw err
+      }
+      const originAborted = err?.name === 'AbortError' && Boolean(existing.aborted || existing.signal?.aborted)
+      if (isCrossRequestError(err) || originAborted) {
+        if (inFlightFetches.get(effectiveKey) === existing) {
+          inFlightFetches.delete(effectiveKey)
+        }
+        continue
+      }
+      throw err
+    }
+  }
+
+  if (explicitSignal && callerSignal?.aborted) {
+    throw toAbortError(callerSignal)
+  }
+
+  const entry = {
+    promise: null,
+    startedAt: now(),
+    signal: callerSignal,
+    aborted: false,
+    abortListeners: new Set(),
+  }
+
+  const onInitiatorAbort = () => {
+    entry.aborted = true
+    if (inFlightFetches.get(effectiveKey) === entry) {
+      inFlightFetches.delete(effectiveKey)
+    }
+    if (explicitSignal || !hasLifecycleWaitUntil) {
+      const listeners = Array.from(entry.abortListeners)
+      entry.abortListeners.clear()
+      for (const notify of listeners) {
+        notify()
+      }
+    }
+  }
+
+  if (callerSignal && typeof callerSignal.addEventListener === 'function') {
+    if (callerSignal.aborted) {
+      entry.aborted = true
+    } else {
+      callerSignal.addEventListener('abort', onInitiatorAbort, { once: true })
+    }
+  }
+
+  const cleanupEntry = () => {
+    entry.abortListeners.clear()
+    if (callerSignal && typeof callerSignal.removeEventListener === 'function') {
+      try {
+        callerSignal.removeEventListener('abort', onInitiatorAbort)
+      } catch {}
+    }
   }
 
   const fetchPromise = (async () => {
     const freshData = await fetchFn()
 
     try {
-      if (shouldCache(freshData)) {
-        waitUntil(
-          (async () => {
+      if (!entry.aborted || hasLifecycleWaitUntil) {
+        if (shouldCache(freshData)) {
+          const writePromise = (async () => {
             await writeEnvelope(freshData)
           })().catch((err) => {
             if (logger?.error) {
               logger.error(`${loggerLabel} cache put failed for key ${effectiveKey}`, err)
             }
-          }),
-        )
+          })
+          safeWaitUntil(waitUntilFn, writePromise)
+        }
       }
     } catch (err) {
       if (logger?.error) {
@@ -368,10 +623,27 @@ export async function withCache({
 
     return freshData
   })().finally(() => {
-    inFlightFetches.delete(effectiveKey)
+    if (inFlightFetches.get(effectiveKey) === entry) {
+      inFlightFetches.delete(effectiveKey)
+    }
+    cleanupEntry()
   })
 
-  inFlightFetches.set(effectiveKey, fetchPromise)
+  entry.promise = fetchPromise
+  if (!entry.aborted) {
+    inFlightFetches.set(effectiveKey, entry)
+  }
+  safeWaitUntil(waitUntilFn, fetchPromise)
+
+  if (explicitSignal && callerSignal) {
+    fetchPromise.catch(() => {})
+    const outcome = await waitForEntry(entry, callerSignal, true, Infinity)
+    if (outcome === ABORTED_SENTINEL || outcome === RETRY_SENTINEL) {
+      throw toAbortError(callerSignal)
+    }
+    return outcome
+  }
+
   return await fetchPromise
 }
 
